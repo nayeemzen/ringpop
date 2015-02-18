@@ -53,10 +53,13 @@ function validateListen(arg) {
         process.exit(1);
     }
 
-    if (!arg.match(HOST_PORT_PATTERN)) {
+    var match = arg.match(HOST_PORT_PATTERN);
+    if (!match) {
         console.log('listen arg must be in `ip:port` format');
         process.exit(1);
     }
+
+    return match;
 }
 
 function main() {
@@ -68,25 +71,21 @@ function main() {
         .parse(process.argv);
 
     var listen = program.listen;
-    validateListen(listen);
-    validateHosts(program.hosts);
-
-    var parts = listen.match(HOST_PORT_PATTERN);
-    var tchannel = new TChannel({
-        host: parts[1],
-        port: +parts[2],
-        logger: createLogger('tchannel')
-    });
+    var parts = validateListen(listen);
+    var hosts = validateHosts(program.hosts);
 
     var ringpop = new RingPop({
         app: 'ringpop',
         hostPort: listen,
         logger: createLogger('ringpop'),
-        channel: tchannel
+        channel: new TChannel({
+            host: parts[1],
+            port: +parts[2],
+            logger: createLogger('tchannel')
+        })
     });
-
-    createRingPopTChannel(ringpop, tchannel);
-    ringpop.bootstrap();
+    ringpop.setupChannel(); // XXX why not just in constructor?
+    ringpop.bootstrap(hosts);
 }
 
 if (require.main === module) {
