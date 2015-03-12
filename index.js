@@ -26,6 +26,7 @@ var globalSetTimeout = require('timers').setTimeout;
 var hammock = require('uber-hammock');
 var metrics = require('metrics');
 
+var flapDamping = require('./lib/flap-damping');
 var Gossip = require('./lib/swim/gossip');
 var sendPing = require('./lib/swim/ping-sender.js');
 var sendPingReq = require('./lib/swim/ping-req-sender.js');
@@ -35,6 +36,7 @@ var createRingPopTChannel = require('./lib/tchannel.js').createRingPopTChannel;
 var Dissemination = require('./lib/dissemination.js');
 var errors = require('./lib/errors.js');
 var HashRing = require('./lib/ring');
+var handleMembershipUpdates = require('./lib/membership-update-handler.js');
 var Membership = require('./lib/membership.js');
 var MembershipIterator = require('./lib/membership-iterator.js');
 var MembershipUpdateRollup = require('./lib/membership-update-rollup.js');
@@ -68,6 +70,8 @@ function RingPop(options) {
     if (!(this instanceof RingPop)) {
         return new RingPop(options);
     }
+
+    var self = this;
 
     if (!options) {
         throw errors.OptionsRequiredError({ method: 'RingPop' });
@@ -114,33 +118,16 @@ function RingPop(options) {
     this.membershipUpdateFlushInterval = options.membershipUpdateFlushInterval ||
         MEMBERSHIP_UPDATE_FLUSH_INTERVAL;
 
-    this.requestProxy = new RequestProxy({
-        ringpop: this,
-        maxRetries: options.requestProxyMaxRetries,
-        retrySchedule: options.requestProxyRetrySchedule
-    });
-
-    this.ring = new HashRing();
-    this.ring.on('added', onRingServerAdded.bind(null, this));
-    this.ring.on('removed', onRingServerRemoved.bind(null, this));
-    this.ring.on('checksumComputed', onRingChecksumComputed.bind(null, this));
-
-    this.dissemination = new Dissemination(this);
+    this.requestProxy = initForwarder();
+    this.ring = initRing();
     this.membership = new Membership(this);
-    this.membership.on('updated', this.onMembershipUpdated.bind(this));
+    this.dissemination = new Dissemination(this);
     this.memberIterator = new MembershipIterator(this);
-    this.gossip = new Gossip({
-        ringpop: this,
-        minProtocolPeriod: options.minProtocolPeriod
-    });
-    this.suspicion = new Suspicion({
-        ringpop: this,
-        suspicionTimeout: options.suspicionTimeout
-    });
-    this.membershipUpdateRollup = new MembershipUpdateRollup({
-        ringpop: this,
-        flushInterval: this.membershipUpdateFlushInterval
-    });
+    this.gossip = initGossip();
+    this.membershipUpdateRollup = initRollup();
+    this.suspicion = initSuspicion();
+
+    addMembershipUpdateListeners();
 
     this.clientRate = new metrics.Meter();
     this.serverRate = new metrics.Meter();
@@ -154,6 +141,54 @@ function RingPop(options) {
 
     this.destroyed = false;
     this.joiner = null;
+
+    function addMembershipUpdateListeners() {
+        self.membership.on('updated', flapDamping(_.extend({
+            ringpop: self
+        }, options.flapDamping)));
+
+        self.membership.on('updated', handleMembershipUpdates({
+            ringpop: self
+        }));
+    }
+
+    function initForwarder() {
+        return new RequestProxy({
+            ringpop: self,
+            maxRetries: options.requestProxyMaxRetries,
+            retrySchedule: options.requestProxyRetrySchedule
+        });
+    }
+
+    function initGossip() {
+        return new Gossip({
+            ringpop: self,
+            minProtocolPeriod: options.minProtocolPeriod
+        });
+    }
+
+    function initRing() {
+        var ring = new HashRing();
+        ring.on('added', onRingServerAdded.bind(null, self));
+        ring.on('removed', onRingServerRemoved.bind(null, self));
+        ring.on('checksumComputed', onRingChecksumComputed.bind(null, self));
+
+        return ring;
+    }
+
+    function initRollup() {
+        return new MembershipUpdateRollup({
+            ringpop: self,
+            flushInterval: self.membershipUpdateFlushInterval
+        });
+    }
+
+    function initSuspicion() {
+        return new Suspicion({
+            ringpop: self,
+            suspicionTimeout: options.suspicionTimeout
+        });
+    }
 }
 
 require('util').inherits(RingPop, EventEmitter);
@@ -182,6 +217,8 @@ RingPop.prototype.destroy = function destroy() {
     if (this.channel) {
         this.channel.quit();
     }
+
+    this.emit('destroyed');
 };
 
 RingPop.prototype.setupChannel = function setupChannel() {
@@ -392,89 +429,6 @@ RingPop.prototype.reload = function reload(file, callback) {
 
 RingPop.prototype.whoami = function whoami() {
     return this.hostPort;
-};
-
-RingPop.prototype.onMemberAlive = function onMemberAlive(change) {
-    this.stat('increment', 'membership-update.alive');
-    this.logger.debug('member is alive', {
-        local: this.whoami(),
-        alive: change.address
-    });
-
-    this.dissemination.recordChange(change);
-    this.ring.addServer(change.address);
-    this.suspicion.stop(change);
-};
-
-RingPop.prototype.onMemberFaulty = function onMemberFaulty(change) {
-    this.stat('increment', 'membership-update.faulty');
-    this.logger.debug('member is faulty', {
-        local: this.whoami(),
-        faulty: change.address,
-    });
-
-    this.dissemination.recordChange(change);
-    this.ring.removeServer(change.address);
-    this.suspicion.stop(change);
-};
-
-RingPop.prototype.onMemberLeave = function onMemberLeave(change) {
-    this.stat('increment', 'membership-update.leave');
-    this.logger.debug('member has left', {
-        local: this.whoami(),
-        left: change.address
-    });
-
-    this.dissemination.recordChange(change);
-    this.ring.removeServer(change.address);
-    this.suspicion.stop(change);
-};
-
-RingPop.prototype.onMemberSuspect = function onMemberSuspect(change) {
-    this.stat('increment', 'membership-update.suspect');
-    this.logger.debug('member is suspect', {
-        local: this.whoami(),
-        suspect: change.address
-    });
-
-    this.suspicion.start(change);
-    this.dissemination.recordChange(change);
-};
-
-RingPop.prototype.onMembershipUpdated = function onMembershipUpdated(updates) {
-    var self = this;
-    var membershipChanged = false;
-    var ringChanged = false;
-
-    updates.forEach(function(update) {
-        if (update.status === 'alive') {
-            self.onMemberAlive(update);
-            ringChanged = membershipChanged = true;
-        } else if (update.status === 'faulty') {
-            self.onMemberFaulty(update);
-            ringChanged = membershipChanged = true;
-        } else if (update.status === 'leave') {
-            self.onMemberLeave(update);
-            ringChanged = membershipChanged = true;
-        } else if (update.status === 'suspect') {
-            self.onMemberSuspect(update);
-            membershipChanged = true;
-        }
-    });
-
-    if (!!membershipChanged) {
-        this.emit('membershipChanged');
-        this.emit('changed'); // Deprecated
-    }
-
-    if (!!ringChanged) {
-        this.emit('ringChanged');
-    }
-
-    this.membershipUpdateRollup.trackUpdates(updates);
-
-    this.stat('gauge', 'num-members', this.membership.members.length);
-    this.stat('timing', 'updates', updates.length);
 };
 
 RingPop.prototype.pingMemberNow = function pingMemberNow(callback) {
