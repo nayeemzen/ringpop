@@ -120,12 +120,9 @@ function testRingpopCluster(opts, name, test) {
 
     tape(name, function onTest(assert) {
         var cluster = bootstrapClusterOf(opts, function onBootstrap(results) {
-            var oldEnd = assert.end.bind(assert);
-
-            assert.end = function newEnd() {
-                oldEnd();
+            assert.on('end', function onEnd() {
                 destroyCluster(cluster);
-            };
+            });
 
             test(results, cluster, assert);
         });
