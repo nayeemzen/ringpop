@@ -163,8 +163,8 @@ testRingpopCluster({
     }, function onPingReq(err, res) {
         assert.ifErr(err, 'no error occurred');
         assertNumBadStatuses(assert, res, pingReqSize - 1);
-        assert.equals(unreachableMember.status, 'alive',
-            'unreachable member is alive');
+        assert.equals(unreachableMember.status, 'suspect',
+            'unreachable member is suspect');
         assert.end();
     });
 });
