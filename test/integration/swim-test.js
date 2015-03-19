@@ -174,7 +174,7 @@ testRingpopCluster({
     tap: function tap(cluster) {
         mkNoGossip(cluster);
     }
-}, 'unreachable ping-req members', function t(bootRes, cluster, assert) {
+}, 'ping-req inconclusive', function t(bootRes, cluster, assert) {
     var ringpop = cluster[0];
     var unreachableMember = ringpop.membership.findMemberByAddress(cluster[4].hostPort);
     var pingReqSize = 3;
@@ -187,14 +187,12 @@ testRingpopCluster({
         ringpop: ringpop,
         unreachableMember: unreachableMember,
         pingReqSize: pingReqSize
-    }, function onPingReq(err, res) {
-        assert.ifErr(err, 'no error occurred');
-        assertNumBadStatuses(assert, res, 0);
-        assert.equals(res.pingReqErrs.length, pingReqSize,
-            'ping-req members are unreachable');
+    }, function onPingReq(err) {
+        assert.ok(err, 'an error occurred');
+        assert.equal(err.type, 'ringpop.ping-req.inconclusive',
+            'ping-req is inconclusive');
         assert.equals(unreachableMember.status, 'alive',
             'unreachable member is alive');
         assert.end();
     });
 });
-
