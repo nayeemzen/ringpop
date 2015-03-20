@@ -22,16 +22,20 @@
 // 3rd party dependencies
 var _ = require('underscore');
 var DebuglogLogger = require('debug-logtron');
+var EventEmitter = require('events').EventEmitter;
 var tape = require('tape');
 
 // 1st party dependencies
 var Ringpop = require('../../index.js');
 var TChannel = require('tchannel');
 
+var CONVERGENCE_TIMER_INTERVAL = 50;
+
 function bootstrapClusterOf(opts, onBootstrap) {
     var cluster = createClusterOf(opts);
+    var nodes = cluster.nodes;
 
-    var bootstrapHosts = cluster.map(function mapRingpop(ringpop) {
+    var bootstrapHosts = nodes.map(function mapRingpop(ringpop) {
         return ringpop.hostPort;
     });
 
@@ -49,14 +53,14 @@ function bootstrapClusterOf(opts, onBootstrap) {
                 nodesJoined: nodesJoined
             };
 
-            if (++count === cluster.length) {
+            if (++count === nodes.length) {
                 onBootstrap(results);
             }
         };
     }
 
-    for (var i = 0; i < cluster.length; i++) {
-        var ringpop = cluster[i];
+    for (var i = 0; i < nodes.length; i++) {
+        var ringpop = nodes[i];
 
         ringpop.bootstrap({
             bootstrapFile: bootstrapHosts
@@ -67,17 +71,78 @@ function bootstrapClusterOf(opts, onBootstrap) {
     return cluster;
 }
 
+function checkConvergence(cluster) {
+    var nonFaultyNodes = getNonFaultyNodes(cluster);
+    var areAllSameChecksum = true;
+    var lastChecksum;
+
+    for (var i = 0; i < nonFaultyNodes.length; i++) {
+        var ringpop = nonFaultyNodes[i];
+        var checksum = ringpop.membership.checksum;
+
+        if (lastChecksum && lastChecksum !== checksum) {
+            areAllSameChecksum = false;
+            break;
+        }
+
+        lastChecksum = checksum;
+    }
+
+    if (areAllSameChecksum) {
+        return true;
+    }
+
+    return false;
+}
+
+function getNonFaultyNodes(cluster) {
+    var nonFaultyNodes = {};
+
+    for (var i = 0; i < cluster.nodes.length; i++) {
+        var ringpop = cluster.nodes[i];
+        var members = ringpop.membership.members;
+
+        for (var j = 0; j < members.length; j++) {
+            var member = members[i];
+
+            if (member.status !== 'faulty') {
+                nonFaultyNodes[member.address] = cluster.findRingpopByAddress(member.address);
+            }
+        }
+    }
+
+    return Object.keys(nonFaultyNodes).map(function mapNodeKey(node) {
+        return nonFaultyNodes[node];
+    });
+}
+
 function createClusterOf(opts) {
     var size = opts.size || 3;
 
-    var cluster = [];
+    var cluster = Object.create(EventEmitter.prototype);
+    var nodes = [];
 
     for (var i = 0; i < size; i++) {
-        cluster.push(createRingpop(_.extend({
+        nodes.push(createRingpop(_.extend({
             host: '127.0.0.1',
             port: 10000 + i
         }, opts)));
     }
+
+    cluster.findRingpopByAddress = function findRingpopByAddress(address) {
+        for (var i = 0; i < cluster.nodes.length; i++) {
+            var ringpop = cluster.nodes[i];
+
+            if (ringpop.hostPort === address) {
+                return ringpop;
+            }
+            console.log('ringpop.hostPort: ' + ringpop.hostPort + ', address: ' + address);
+        }
+
+        return null;
+    }
+
+    cluster.nodes = nodes;
 
     return cluster;
 }
@@ -106,7 +171,7 @@ function createRingpop(opts) {
 }
 
 function destroyCluster(cluster) {
-    cluster.forEach(function eachRingpop(ringpop) {
+    cluster.nodes.forEach(function eachRingpop(ringpop) {
         ringpop.destroy();
     });
 }
@@ -120,6 +185,8 @@ function testRingpopCluster(opts, name, test) {
 
     tape(name, function onTest(assert) {
         var cluster = bootstrapClusterOf(opts, function onBootstrap(results) {
+            monitorConvergence(cluster);
+
             assert.on('end', function onEnd() {
                 destroyCluster(cluster);
             });
@@ -127,6 +194,18 @@ function testRingpopCluster(opts, name, test) {
             test(results, cluster, assert);
         });
     });
+
+    function monitorConvergence(cluster) {
+        var checksums = {};
+
+        cluster.nodes.forEach(function eachNode(ringpop) {
+            ringpop.on('membershipChanged', function onUpdated() {
+                if (checkConvergence(cluster)) {
+                    cluster.emit('converged');
+                }
+            });
+        });
+    }
 }
 
 module.exports = testRingpopCluster;

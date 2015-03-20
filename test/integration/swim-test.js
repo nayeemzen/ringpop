@@ -31,12 +31,9 @@ function assertNumBadStatuses(assert, res, num) {
     assert.equals(badStatuses.length, num, 'correct number of bad statuses');
 }
 
-function mkNoGossip(cluster) {
-    var noop = function noop() {
-    };
-
-    cluster.forEach(function eachRingpop(ringpop) {
-        ringpop.gossip.start = noop;
+function mkBadPingResponder(ringpop) {
+    ringpop.channel.register('/protocol/ping', function protocolPing(arg1, arg2, hostInfo, cb) {
+        cb(null, null, JSON.stringify('badbody'));
     });
 }
 
@@ -46,23 +43,32 @@ function mkBadPingReqResponder(ringpop) {
     });
 }
 
+function mkNoGossip(cluster) {
+    var noop = function noop() {
+    };
+
+    cluster.nodes.forEach(function eachRingpop(ringpop) {
+        ringpop.gossip.start = noop;
+    });
+}
+
 testRingpopCluster({
     tap: function tap(cluster) {
         mkNoGossip(cluster);
     }
 }, 'ping-reqs 1 member', function t(bootRes, cluster, assert) {
-    var ringpop = cluster[0];
-    var unreachableMember = ringpop.membership.findMemberByAddress(cluster[1].hostPort);
+    var ringpop = cluster.nodes[0];
+    var unreachableMember = ringpop.membership.findMemberByAddress(cluster.nodes[1].hostPort);
 
     sendPingReq({
-        ringpop: cluster[0],
+        ringpop: cluster.nodes[0],
         unreachableMember: unreachableMember,
         pingReqSize: 3
     }, function onPingReq(err, res) {
         assert.ifErr(err, 'no error occurred');
         assert.equal(res.pingReqAddrs.length, 1,
             'number of selected ping-req members is correct');
-        assert.ok(res.pingReqSuccess.address === cluster[2].hostPort,
+        assert.ok(res.pingReqSuccess.address === cluster.nodes[2].hostPort,
             'successful ping-req response from either member');
         assert.end();
     });
@@ -74,13 +80,13 @@ testRingpopCluster({
         mkNoGossip(cluster);
     }
 }, 'ping-reqs pingReqSize members', function t(bootRes, cluster, assert) {
-    var ringpop = cluster[0];
+    var ringpop = cluster.nodes[0];
     var unreachableMember = ringpop.membership.
-        findMemberByAddress(cluster[1].hostPort);
+        findMemberByAddress(cluster.nodes[1].hostPort);
     var pingReqSize = 3;
 
     sendPingReq({
-        ringpop: cluster[0],
+        ringpop: cluster.nodes[0],
         unreachableMember: unreachableMember,
         pingReqSize: pingReqSize
     }, function onPingReq(err, res) {
@@ -99,10 +105,10 @@ testRingpopCluster({
         mkNoGossip(cluster);
     }
 }, 'ping-req target unreachable', function t(bootRes, cluster, assert) {
-    var badRingpop = cluster[4];
+    var badRingpop = cluster.nodes[4];
     badRingpop.destroy();
 
-    var ringpop = cluster[0];
+    var ringpop = cluster.nodes[0];
     var unreachableMember = ringpop.membership.findMemberByAddress(badRingpop.hostPort);
     var pingReqSize = 3;
 
@@ -125,8 +131,8 @@ testRingpopCluster({
         mkNoGossip(cluster);
     }
 }, 'no ping-req members', function t(bootRes, cluster, assert) {
-    var ringpop = cluster[0];
-    var ringpop2Addr = cluster[1].hostPort;
+    var ringpop = cluster.nodes[0];
+    var ringpop2Addr = cluster.nodes[1].hostPort;
 
     var unreachableMember = ringpop.membership.findMemberByAddress(ringpop2Addr);
     var pingReqSize = 3;
@@ -145,14 +151,14 @@ testRingpopCluster({
 testRingpopCluster({
     size: 5,
     tap: function tap(cluster) {
-        mkBadPingReqResponder(cluster[3]);
+        mkBadPingReqResponder(cluster.nodes[3]);
         mkNoGossip(cluster);
     }
 }, 'some bad ping-statuses', function t(bootRes, cluster, assert) {
-    var badRingpop = cluster[4];
+    var badRingpop = cluster.nodes[4];
     badRingpop.destroy();
 
-    var ringpop = cluster[0];
+    var ringpop = cluster.nodes[0];
     var unreachableMember = ringpop.membership.findMemberByAddress(badRingpop.hostPort);
     var pingReqSize = 3;
 
@@ -175,8 +181,8 @@ testRingpopCluster({
         mkNoGossip(cluster);
     }
 }, 'ping-req inconclusive', function t(bootRes, cluster, assert) {
-    var ringpop = cluster[0];
-    var unreachableMember = ringpop.membership.findMemberByAddress(cluster[4].hostPort);
+    var ringpop = cluster.nodes[0];
+    var unreachableMember = ringpop.membership.findMemberByAddress(cluster.nodes[4].hostPort);
     var pingReqSize = 3;
 
     ringpop.membership.members.forEach(function eachMember(member) {
@@ -195,4 +201,41 @@ testRingpopCluster({
             'unreachable member is alive');
         assert.end();
     });
+});
+
+testRingpopCluster('cluster converges on faulty member', function t(bootRes, cluster, assert) {
+    var badRingpop = cluster.nodes[2];
+    var badAddr = badRingpop.hostPort;
+
+    function assertSuspectConvergence() {
+        cluster.once('converged', function onConverged() {
+            var agree = cluster.nodes.filter(function filterNode(ringpop) {
+                return ringpop.membership.findMemberByAddress(badAddr).status === 'suspect';
+            });
+
+            assert.equal(agree.length, 2, 'converge on suspect');
+            assertFaultyConvergence();
+        });
+    }
+
+    function assertFaultyConvergence() {
+        cluster.once('converged', function onConverged() {
+            var agree = cluster.nodes.filter(function filterNode(ringpop) {
+                return ringpop.hostPort !== badAddr &&
+                    ringpop.membership.findMemberByAddress(badAddr).status === 'faulty';
+            });
+
+            assert.equal(agree.length, 2, 'converge on faulty');
+            assert.end();
+        });
+    }
+
+    assertSuspectConvergence();
+
+    // Stop gossip so that it doesn't reassert itself as alive
+    badRingpop.gossip.stop();
+
+    // Have badRingpop cause ping errors so that it eventually
+    // becomes faulty.
+    mkBadPingResponder(badRingpop);
 });
